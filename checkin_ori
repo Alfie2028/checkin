@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+河南农大晚归签到自动化脚本
+加密方式：AES-ECB + MD5签名 + 动态密钥
+"""
+
+import requests
+import json
+import hashlib
+import base64
+import time
+import random
+import logging
+from datetime import datetime
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+
+JWT_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIxNTAiLCJleHAiOjE3ODk5OTk5Mjd9.hNsAq7jXeOSOClmQHFXPp7hlhOg3IcFwPeRsf7xsSCc"
+
+# 宿舍坐标
+LATITUDE = "34.1390460"
+LONGITUDE = "113.7984010"
+LOCATION_ADDRESS = "34.139046, 113.798401"
+
+# 签到规则ID
+RULE_ID = 1
+
+# 签到时间窗口
+CHECKIN_START_HOUR = 22
+CHECKIN_START_MINUTE = 0
+CHECKIN_END_HOUR = 22
+CHECKIN_END_MINUTE = 30
+
+# 随机延迟范围（秒）
+RANDOM_DELAY_MIN = 6
+RANDOM_DELAY_MAX = 20
+
+# 重试次数
+MAX_RETRY = 3
+RETRY_INTERVAL = 10
+
+# Server酱通知密钥（可选，不用就留空，签到结果会推送到微信）
+SERVER_CHAN_KEY = ""
+
+# 日志配置
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# ====================== 固定配置（你的真实设备信息，不用改） ======================
+BASE_URL = "https://xhbcs.henau.edu.cn/api"
+
+HEADERS = {
+    "Authorization": f"Bearer {JWT_TOKEN}",
+    "User-Agent": "Mozilla/5.0 (Linux; Android 12; FIN-AL60a Build/HUAWEIFIN-AL60a; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/150.0.7871.189 Mobile Safari/537.36 XWEB/1500135 MMWEBSDK/20260604 MMWEBID/2001 REV/e878cb686d1d134ef14d1b7d54204067d9182dea MicroMessenger/8.0.77.3160(0x28004D36) WeChat/arm64 Weixin NetType/4G Language/zh_CN ABI/arm64",
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+    "sec-ch-ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Android WebView";v="150"',
+    "sec-ch-ua-mobile": "?1",
+    "sec-ch-ua-platform": '"Android"',
+    "X-Requested-With": "com.tencent.mm",
+    "Origin": "https://xhbcs.henau.edu.cn",
+    "Referer": "https://xhbcs.henau.edu.cn/",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+}
+
+DEVICE_MODEL = "Huawei Huawei FIN-AL60A"
+DEVICE_SYSTEM = "Android 12"
+
+# ====================== 加密函数（1:1还原前端JS） ======================
+def rx(s: str) -> str:
+    """对应JS rx函数：去掉索引1、4、7的字符"""
+    skip_indices = {1, 4, 7}
+    return ''.join(c for i, c in enumerate(s) if i not in skip_indices)
+
+def se(data: dict) -> dict:
+    """对应JS Se函数：字段按字母排序，过滤空值"""
+    return {
+        k: v for k, v in sorted(data.items())
+        if v is not None and v != ""
+    }
+
+def re_sign(data: dict, key: str) -> str:
+    """对应JS Re函数：拼接字段+key，MD5大写"""
+    items = [f"{k}={v}" for k, v in data.items()]
+    sign_str = "&".join(items) + f"&key={key}"
+    return hashlib.md5(sign_str.encode()).hexdigest().upper()
+
+def ze_encrypt(plaintext: str, key_b64: str) -> str:
+    """对应JS ze函数：AES-ECB-Pkcs7加密，输出Base64"""
+    key = base64.b64decode(key_b64)
+    cipher = AES.new(key, AES.MODE_ECB)
+    padded = pad(plaintext.encode(), AES.block_size)
+    encrypted = cipher.encrypt(padded)
+    return base64.b64encode(encrypted).decode()
+
+# ====================== 业务函数 ======================
+def send_notification(title: str, content: str):
+    """Server酱微信通知"""
+    if not SERVER_CHAN_KEY:
+        return
+    try:
+        url = f"https://sctapi.ftqq.com/{SERVER_CHAN_KEY}.send"
+        requests.post(url, data={"title": title, "desp": content}, timeout=10)
+    except Exception as e:
+        logger.warning(f"通知发送失败: {e}")
+
+def get_prepare() -> tuple:
+    """调用prepare接口获取动态密钥和nonce"""
+    resp = requests.get(f"{BASE_URL}/checkin/prepare", headers=HEADERS, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 200:
+        raise Exception(f"prepare接口失败: {data}")
+    return data["data"]["a"], data["data"]["b"], data["data"]["nonce"]
+
+def get_status() -> dict:
+    """查询签到状态"""
+    resp = requests.get(
+        f"{BASE_URL}/checkin/status",
+        params={"ruleId": RULE_ID},
+        headers=HEADERS,
+        timeout=15
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+def do_checkin() -> dict:
+    """执行一次签到"""
+    # 1. 获取动态密钥和nonce
+    a, b, nonce = get_prepare()
+    logger.info("获取动态密钥和nonce成功")
+    
+    # 2. 处理得到签名密钥和加密密钥
+    sign_key = rx(a)
+    encrypt_key = rx(b)
+    
+    # 3. 组装明文（所有值转字符串，和JS完全一致）
+    plain_data = {
+        "ruleId": str(RULE_ID),
+        "latitude": str(LATITUDE),
+        "longitude": str(LONGITUDE),
+        "deviceModel": DEVICE_MODEL,
+        "deviceSystem": DEVICE_SYSTEM,
+        "locationAddress": LOCATION_ADDRESS,
+        "timeMillis": str(int(time.time() * 1000))
+    }
+    
+    # 4. 排序过滤
+    sorted_data = se(plain_data)
+    
+    # 5. 加签名
+    sorted_data["sign"] = re_sign(sorted_data, sign_key)
+    
+    # 6. JSON序列化（必须无空格，和JS的JSON.stringify一致）
+    json_str = json.dumps(sorted_data, separators=(",", ":"), ensure_ascii=False)
+    
+    # 7. AES加密得到param
+    param = ze_encrypt(json_str, encrypt_key)
+    logger.info("生成param成功")
+    
+    # 8. 提交签到
+    resp = requests.post(
+        f"{BASE_URL}/checkin",
+        headers=HEADERS,
+        json={"param": param, "nonce": nonce},
+        timeout=15
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+def is_in_checkin_time() -> bool:
+    """判断当前是否在签到时间窗口内"""
+    now = datetime.now()
+    current_minutes = now.hour * 60 + now.minute
+    start_minutes = CHECKIN_START_HOUR * 60 + CHECKIN_START_MINUTE
+    end_minutes = CHECKIN_END_HOUR * 60 + CHECKIN_END_MINUTE
+    return start_minutes <= current_minutes <= end_minutes
+
+def verify_checkin_success() -> bool:
+    """验证是否真的签到成功"""
+    time.sleep(3)  # 等一下，避免数据库还没更新
+    status = get_status()
+    return status.get("data", {}).get("hasCheckedIn", False)
+
+def main():
+    logger.info("=" * 50)
+    logger.info("签到脚本启动")
+    
+    # 1. 先查状态
+    try:
+        status = get_status()
+        data = status.get("data", {})
+    except Exception as e:
+        logger.error(f"查询状态失败: {e}")
+        send_notification("签到失败", f"查询状态失败: {e}")
+        return
+    
+    # 2. 已经签到过了
+    if data.get("hasCheckedIn"):
+        logger.info(f"今日已签到: {data.get('message')}")
+        send_notification("签到结果", f"今日已签到: {data.get('message')}")
+        return
+    
+    # 3. 不在签到时间
+    if not data.get("canCheckin") and not is_in_checkin_time():
+        logger.info(f"当前不在签到时间: {data.get('message')}")
+        return
+    
+    # 4. 随机延迟，模拟真人
+    delay = random.randint(RANDOM_DELAY_MIN, RANDOM_DELAY_MAX)
+    logger.info(f"随机延迟 {delay} 秒后开始签到")
+    time.sleep(delay)
+    
+    # 5. 重试签到
+    for attempt in range(1, MAX_RETRY + 1):
+        try:
+            logger.info(f"第 {attempt}/{MAX_RETRY} 次尝试签到")
+            result = do_checkin()
+            logger.info(f"签到接口返回: {result}")
+            
+            if result.get("code") == 200:
+                # 验证是否真的成功
+                if verify_checkin_success():
+                    logger.info("✅ 签到成功并验证通过")
+                    send_notification("✅ 签到成功", f"签到时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    return
+                else:
+                    logger.warning("接口返回成功但验证失败，重试")
+            else:
+                logger.warning(f"签到失败: {result.get('message')}")
+                
+        except Exception as e:
+            logger.error(f"第 {attempt} 次签到异常: {e}")
+        
+        if attempt < MAX_RETRY:
+            logger.info(f"等待 {RETRY_INTERVAL} 秒后重试")
+            time.sleep(RETRY_INTERVAL)
+    
+    # 6. 全部重试失败
+    logger.error("❌ 所有重试均失败")
+    send_notification("❌ 签到失败", "所有重试均失败，请手动检查")
+
+if __name__ == "__main__":
+    main()
